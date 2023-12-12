@@ -102,6 +102,51 @@ $d'_{i-1}e^{m_{i-1} - m_{i}}$就能将过时的max给替换掉了
 
 - online处理是会导致**精度损失**的(至少在tiny版本上)
 
+## flash attention 2
+
+- flash attention 1的问题
+    * 频繁的li, mi, oi更新
+        + 一方面是频繁的非矩阵乘法
+            + oi最后更新
+        + 一方面是频繁的写
+            + 内外循环顺序
+
+1. 减少非矩阵乘法(non-matmul)操作
+2. 并行计算attn, 即使是单头
+3. 考虑多在thread block内计算, 减少跨组通信
+
+- flow
+    * 与flash attention1对比
+        + 局部值(oi, mi, li)就不用多次更新了, 一轮外部循环一行就能处理完成
+
+- tips
+    * flash attention 2中分块的形状要特别注意
+
+```python
+# flash attention 1 的循环
+for j in range(k_block_num):
+    kj = K_BLOCKS[j]
+    vj = V_BLOCKS[j]
+
+    for i in range(q_block_num):
+        qi = Q_BLOCKS[i]
+
+# flash attention 2 的循环
+for j in range(k_block_num):
+    qi = Q_BLOCKS[i]
+
+    for i in range(q_block_num):
+        kj = K_BLOCKS[j]
+        vj = V_BLOCKS[j]
+```
+
+
+
+
+
+
+
+
 
 
 
