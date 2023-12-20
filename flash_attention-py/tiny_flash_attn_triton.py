@@ -213,20 +213,16 @@ def ref_attn(q, k, v, causal=True, sm_scale=1):
     if causal:
         p[:, :, M == 0] = float("-inf")
     p = torch.softmax(p.float(), dim=-1).half()
-    # p = torch.exp(p)
     ref_out = torch.matmul(p, v)
     return ref_out
 
-def test_op():
-    BS, HEAD, SEQLEN, DIM = 1, 2, 1024, 64
-    causal = True
+def causal_test(BS, HEAD, SEQLEN, DIM, causal):
     dtype = torch.float16
     torch.manual_seed(20)
     q = (torch.empty((BS, HEAD, SEQLEN, DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
     k = (torch.empty((BS, HEAD, SEQLEN, DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
     v = (torch.empty((BS, HEAD, SEQLEN, DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
     sm_scale = 0.5
-    dout = torch.randn_like(q)
 
     # reference implementation
     time_ref = time.time()
@@ -235,15 +231,14 @@ def test_op():
 
     # triton implementation
     time_tri = time.time()
-    tri_out = flash_attn_triton(q, k, v, causal, sm_scale).half()
+    tri_out = flash_attn_triton(q, k, v, causal=causal, sm_scale=sm_scale).half()
     time_tri = time.time() - time_tri
 
     # compare
     assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
-    print("ref time: {:.4f} ms, tri time: {:.4f}".format(time_ref * 1000, time_tri * 1000))
+    print("causal = {} ref time: {:.4f} ms, tri time: {:.4f}".format(causal, time_ref * 1000, time_tri * 1000))
 
-def main():
-    test_op()
-
-if __name__ == "__main__":
-    main()
+def test_attention():
+    BS, HEAD, SEQLEN, DIM = 1, 2, 1024, 64
+    causal_test(BS, HEAD, SEQLEN, DIM, causal=False)
+    causal_test(BS, HEAD, SEQLEN, DIM, causal=True)
