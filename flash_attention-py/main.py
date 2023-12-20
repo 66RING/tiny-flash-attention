@@ -1,6 +1,9 @@
 import torch
 import math
 import tiny_flash_attn
+from tiny_flash_attn_triton import flash_attn_triton, ref_attn
+
+from flash_attn import flash_attn_func as flash_attn_func_cuda
 
 class BaseAttention:
     def __init__(self):
@@ -38,29 +41,30 @@ class OnlineSafeAttention(BaseAttention):
     def __init__(self):
         self.BLOCK_M = 4
 
-    def attention(self, q, k, v, device='cpu'):
+    def attention(self, q, k, v, device='cuda'):
         return tiny_flash_attn.flash_attn(q, k, v, device, self.BLOCK_M)
 
-    def attention_v1(self, q, k, v, device='cpu'):
+    def attention_v1(self, q, k, v, device='cuda'):
         return tiny_flash_attn.flash_attn_v1(q, k, v, device, self.BLOCK_M)
 
-    def attention_v2(self, q, k, v, device='cpu'):
+    def attention_v2(self, q, k, v, device='cuda'):
         return tiny_flash_attn.flash_attn_v2(q, k, v, device, self.BLOCK_M)
 
-    def attention_v2_multihead(self, q, k, v, device='cpu'):
+    def attention_v2_multihead(self, q, k, v, device='cuda'):
         return tiny_flash_attn.flash_attn_v2_multihead(q, k, v, device, self.BLOCK_M)
 
+def get_tensors(BS, HEAD, SEQLEN, DIM, dtype=torch.float16):
+    q = (torch.empty((BS, HEAD, SEQLEN, DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+    k = (torch.empty((BS, HEAD, SEQLEN, DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+    v = (torch.empty((BS, HEAD, SEQLEN, DIM), dtype=dtype, device="cuda").normal_(mean=0.0, std=0.5).requires_grad_())
+    return q, k, v
 
 def main():
-    bs, head, seqlen, d = 1, 1, 160, 80
-    q = torch.randn(bs, head, seqlen, d)
-    # To avoid precision loss.
-    # NOTE: softmax_scale should be implemented in the Attention class
-    # But I just let native softmax to be itself.
-    softmax_scale = math.sqrt(q.shape[-1])
-    q /= softmax_scale
-    k = torch.randn(bs, head, seqlen, d)
-    v = torch.randn(bs, head, seqlen, d)
+    BS, HEAD, SEQLEN, DIM = 1, 1, 128, 64
+
+    q,k,v = get_tensors(BS, HEAD, SEQLEN, DIM, dtype=torch.float16)
+    # softmax_scale = math.sqrt(q.shape[-1])
+    # q /= softmax_scale
 
     native = NativeAttention()
     safe = SafeAttention()
@@ -71,20 +75,31 @@ def main():
     online_result1 = online.attention_v1(torch.squeeze(q), torch.squeeze(k), torch.squeeze(v))
     online_result2 = online.attention_v2(torch.squeeze(q), torch.squeeze(k), torch.squeeze(v))
     online_result2_multi = online.attention_v2_multihead(q, k, v)
-    online_result2_multi = torch.squeeze(online_result2_multi)
 
-    print(native_result.to(device='cpu'))
-    print(safe_result.to(device='cpu'))
-    print(online_result1.to(device='cpu'))
-    print(online_result2.to(device='cpu'))
-    print(online_result2_multi.to(device='cpu'))
+    causal=False
+    ref_result = ref_attn(q, k, v, causal=causal)
+    triton_result = flash_attn_triton(q, k, v, causal=causal)
+    official_result = flash_attn_func_cuda(q, k, v, causal=causal)
+
+    # print(native_result)
+    # print(safe_result)
+    # print(online_result1)
+    # print(online_result2)
+    # print(online_result2_multi)
+    print(ref_result)
+    print(triton_result)
+    print(official_result)
 
     # Assert attention output is same.
     # But it may have precision loss compared with native.
-    assert torch.allclose(native_result.to(device='cpu'), safe_result.to(device='cpu'), rtol=1e-4, atol=1e-6)
-    assert torch.allclose(safe_result.to(device='cpu'), online_result1.to(device='cpu'), rtol=1e-4, atol=1e-6)
-    assert torch.allclose(online_result2.to(device='cpu'), online_result1.to(device='cpu'), rtol=1e-4, atol=1e-6)
-    assert torch.allclose(online_result2_multi.to(device='cpu'), online_result1.to(device='cpu'), rtol=1e-4, atol=1e-6)
+    assert torch.allclose(native_result, safe_result, rtol=0, atol=1e-2)
+    assert torch.allclose(safe_result, online_result1.half(), rtol=0, atol=1e-2)
+    assert torch.allclose(online_result2, online_result1, rtol=0, atol=1e-2)
+    assert torch.allclose(online_result2_multi, online_result1, rtol=0, atol=1e-2)
+    assert torch.allclose(triton_result, ref_result, rtol=0, atol=1e-2)
+
+    # assert torch.allclose(official_result, triton_result, rtol=0, atol=1e-2)
+    # assert torch.allclose(official_result, ref_result, rtol=0, atol=1e-2)
 
 if __name__ == "__main__":
     main()

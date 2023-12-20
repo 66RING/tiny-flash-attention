@@ -1,16 +1,13 @@
 import torch
 import math
 
-def flash_attn_v1(q, k, v, device='cpu', BLOCK_M=4):
+def flash_attn_v1(q, k, v, device='cuda', BLOCK_M=4):
     '''
     The tiny flash attention implement
     '''
     assert q.shape == k.shape
     assert q.shape == v.shape
 
-    q = q.to(device=device)
-    k = k.to(device=device)
-    v = v.to(device=device)
     # Create output buffer in HBM.
     output_buffer = torch.zeros(v.shape, device=device)
     # Create denominator buffer in HBM.
@@ -68,7 +65,7 @@ def flash_attn_v1(q, k, v, device='cpu', BLOCK_M=4):
             # Update denominator.
             new_d = old_d * torch.exp(old_m - new_m) + curr_d * torch.exp(local_m - new_m)
             # Update old output and accumulate new output.
-            new_o = (old_d * torch.exp(old_m - new_m) * old_o / new_d) + (torch.exp(local_m - new_m) * safe_e / new_d @ vj)
+            new_o = (old_d * torch.exp(old_m - new_m) * old_o / new_d) + (torch.exp(local_m - new_m) * safe_e / new_d @ vj.float())
 
 
             # Store new value.
@@ -81,16 +78,13 @@ def flash_attn_v1(q, k, v, device='cpu', BLOCK_M=4):
 
     return output_buffer
 
-def flash_attn_v2(q, k, v, device='cpu', BLOCK_M=4):
+def flash_attn_v2(q, k, v, device='cuda', BLOCK_M=4):
     '''
     The tiny flash attention implement
     '''
     assert q.shape == k.shape
     assert q.shape == v.shape
 
-    q = q.to(device=device)
-    k = k.to(device=device)
-    v = v.to(device=device)
     # Create output buffer in HBM.
     output_buffer = torch.zeros(v.shape, device=device)
 
@@ -127,7 +121,7 @@ def flash_attn_v2(q, k, v, device='cpu', BLOCK_M=4):
             # Update denominator.
             new_d = old_d * torch.exp(old_m - new_m) + curr_d
             # Update old output and accumulate new output.
-            new_o = old_o * torch.exp(old_m - new_m) + safe_e  @ vj
+            new_o = old_o * torch.exp(old_m - new_m) + safe_e  @ vj.float()
 
             old_m = new_m
             old_d = new_d
@@ -191,7 +185,7 @@ def flash_attn_v2_multihead(q, k, v, device='cpu', BLOCK_M=4):
             # Update denominator.
             new_d = old_d * torch.exp(old_m - new_m) + curr_d
             # Update old output and accumulate new output.
-            new_o = old_o * torch.exp(old_m - new_m) + safe_e  @ vj
+            new_o = old_o * torch.exp(old_m - new_m) + safe_e  @ vj.float()
 
             old_m = new_m
             old_d = new_d
