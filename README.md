@@ -1,6 +1,7 @@
 # Tiny FlashAttention
 
-- [python version]
+- [python version](#flash-attention-2)
+- [triton version](#triton-flash-attention-2)
 - [rust version]
 - [c version]
 
@@ -139,6 +140,35 @@ for j in range(k_block_num):
         kj = K_BLOCKS[j]
         vj = V_BLOCKS[j]
 ```
+
+## triton flash attention 2
+
+[source code](./flash_attention-py/tiny_flash_attn_triton.py)
+
+用triton实现一个shape为`bs, head, seqlen, dim`的qkv的attention。
+
+1. 考虑计算所需的thread blocks, 即grid
+    - 对于flash attn 2, 可以将外层的q循环并行处理, 及每个thread执行的是一部分q和其他所有kv的attention
+    - 对于Q的分块处理(即分seqlen, 即分token), 如果一次处理`BLOCK_M`个token, 那么一次完整的attention计算需要`cdiv(seqlen, BLOCK_M)`个thread, cdiv表示除法向上取整
+    - 每次kernel计算只需要后两维度, 即(seqlen, dim), 那么前两个维度有多少就需要多少thread来处理。因此将`grid[1]`置为`bs * head`
+    - 因此最终grid为`[cdiv(seqlen, BLOCKM), bs * head]`
+2. kernel设计, 设计并行程序
+    - 计算thread处理各自负责的数据
+    - 计算`(bs, head, seqlen, dim)`访问`head+1`时需要的offset
+        * 可以使用`Tensor.stride(dim)`计算访问dim这个维度的下一个元素时所需跳过的元素数
+        * 根据`grid[1]`记录而`bs*head`的大小和`q.stride(1)`, thread找到自己负责的范围
+    - **使用`tl.make_block_ptr()`API分块读取qkv**, q根据`BLOCK_M`分块, kv根据`BLOCK_N`分块
+        * 使用base参数找到正确的(bs, head)位置
+        * 使用shape和order参数定义内存布局
+            + 取`shape=(seqlen, dim)`, `order=(1, 0)`的q, v块, `order=(1, 0)`表示第二个维度在存储中的内侧
+            + 取`shape=(dim, seqlen)`, `order=(0, 1)`的k块, `order=(0, 1)`表示第二个维度在存储中的外侧, 相当于对k做转置
+            + API会根据order指定的顺序去构造所需的shape
+        * 使用`block_shape`定义整个块的shape, `shape`参数则是每次读取整个块中的一部分的大小
+        * 使用`strides`参数定义每次q, k, v块指针递增时的步长
+    - Q根据`BLOCK_M`分块, K和V根据`BLOCK_N`分块
+3. flash attention 2算法
+    - 因为CSE(common subexpression elimination), LICM(loop invariant code motion)不支持`exp()`所以使用`exp2()`代替, 即`2^x`
+
 
 
 
