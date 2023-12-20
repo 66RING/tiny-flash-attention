@@ -9,7 +9,6 @@ import triton
 import triton.language as tl
 
 def flash_attn_triton(q, k, v, causal=True, sm_scale=1):
-    # assert causal, "only support causal mode"
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
@@ -138,7 +137,7 @@ def _fwd_kernel(
     # loop over k, v and update accumulator
     lo = 0
     # NOTE:: CAUSAL就是常说的不能看到后面的文本的自回归模型
-    hi = (start_m + 1) * BLOCK_M if IS_CAUSAL else DIM
+    hi = (start_m + 1) * BLOCK_M if IS_CAUSAL else SEQLEN
     # NOTE:
     # 当前q和0..seqlen的kv算attention
     # 每次批处理BLOCK_N个k, v(即k, v以BLOCK_N分块)
