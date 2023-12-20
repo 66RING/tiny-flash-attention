@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 def flash_attn_triton(q, k, v, causal=True, sm_scale=1):
+    # assert causal, "only support causal mode"
     # shape constraints
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
     assert Lq == Lk and Lk == Lv
@@ -206,6 +207,17 @@ def _fwd_kernel(
     )
     tl.store(O_block_ptr, out_buffer.to(tl.float16))
 
+def ref_attn(q, k, v, causal=True, sm_scale=1):
+    SEQLEN = q.shape[-2]
+    M = torch.tril(torch.ones((SEQLEN, SEQLEN), device="cuda"))
+    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
+    if causal:
+        p[:, :, M == 0] = float("-inf")
+    p = torch.softmax(p.float(), dim=-1).half()
+    # p = torch.exp(p)
+    ref_out = torch.matmul(p, v)
+    return ref_out
+
 def test_op():
     BS, HEAD, SEQLEN, DIM = 1, 2, 1024, 64
     causal = True
@@ -219,13 +231,7 @@ def test_op():
 
     # reference implementation
     time_ref = time.time()
-    M = torch.tril(torch.ones((SEQLEN, SEQLEN), device="cuda"))
-    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
-    if causal:
-        p[:, :, M == 0] = float("-inf")
-    p = torch.softmax(p.float(), dim=-1).half()
-    # p = torch.exp(p)
-    ref_out = torch.matmul(p, v)
+    ref_out = ref_attn(q, k, v, causal=causal, sm_scale=sm_scale)
     time_ref = time.time() - time_ref
 
     # triton implementation
