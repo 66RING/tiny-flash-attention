@@ -11,8 +11,6 @@
 #include "flash.h"
 #include "flash_api.h"
 
-void hello() { std::cout << "hi" << std::endl; }
-
 void run_flash_attn_fwd(Qkv_params& params, cudaStream_t stream,
                         bool force_split_kernel = false) {
     // TODO:使用static switch来使用泛型

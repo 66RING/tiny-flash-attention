@@ -21,7 +21,6 @@ void set_params_fprop(Qkv_params& params,
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // m.def("package_name", &function_name, "function_docstring"")
-    m.def("hello", &hello, "Prints hello world from c file");
     m.def("tiny_flash_attn_cuda", &tiny_flash_attn_cuda,
           "Flash attention 2 implement in cuda");
 }

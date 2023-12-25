@@ -15,8 +15,6 @@
     CHECK_CUDA(x);                                                             \
     CHECK_CONTIGUOUS(x)
 
-void hello();
-
 void set_params_fprop(Qkv_params& params,
                       // sizes
                       const size_t bs, const size_t head, const size_t seqlen,
