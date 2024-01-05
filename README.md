@@ -1,9 +1,16 @@
 # Tiny FlashAttention
 
+WIP
+
 - [python version](#flash-attention-2)
+    * [naive pure python code](./flash_attention_py/tiny_flash_attn.py)
 - [triton version](#triton-flash-attention-2)
-- [rust version]
+    * [triton code](./flash_attention_py/tiny_flash_attn_triton.py)
 - [c version]
+    * TODO: [naive pure c code]()
+    * TODO: [naive cuda code]()
+    * TODO: [cutlass cuda code]()
+- [rust version]
 
 A tiny [flash attention](https://github.com/Dao-AILab/flash-attention) implement in python, rust, cuda and c for learning purpose.
 
