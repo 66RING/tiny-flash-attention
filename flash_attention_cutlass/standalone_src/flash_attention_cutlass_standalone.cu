@@ -31,22 +31,24 @@ const int Bm = 64;
 const int Bn = 64;
 // TODO: 测试更大规模, 或者warps=2
 
-// seqlen
-const int Input_seq = 128 * 4;
-// dim
-const int Dim = 4 * 8 * 2;
 // TODO: causal模式下, warp!=1情况有bug
 // 使用kNThreads
 const int Warps = 4;
+const bool IS_CAUSAL = false;
 
-const bool IS_CAUSAL = true;
+const int BS = 2;
+const int HEAD = 16;
+const int SEQLEN = 128 * 3;
+const int DIM = 64;
+// const float softmax_scale = 1.f / sqrtf(static_cast<float>(SEQLEN));
+const float softmax_scale = 1.f;
 
 // debug only
 int TX = 3;
 int TY = 0;
 
 // TODO: test trait
-using Test_Traits = Flash_fwd_kernel_traits<Dim, Bm, Bn, Warps, FPC>;
+using Test_Traits = Flash_fwd_kernel_traits<DIM, Bm, Bn, Warps, FPC>;
 
 
 // Shared Storage with Aligned addresses.
@@ -65,7 +67,7 @@ struct SharedStorage {
     if (error != cudaSuccess) {                                                \
       printf("CUDA_CHECK error in line %d of file %s \
               : %s \n",                                                        \
-             __LINE__, __FILE__, cudaGetErrorString(cudaGetLastError()));      \
+             __LINE__, __FILE__, cudaGetErrorString(error));      \
       exit(EXIT_FAILURE);                                                      \
     }                                                                          \
   } while (0)
@@ -130,12 +132,8 @@ __global__ void row_softmax(FP *input, FP *output, int n);
 __global__ void naive_pv(FP *P, FP *V, FP *O, int M, int N,
                          int mBlock);
 
-template<typename T>
-void print_host_matrix(T *matrix, int m, int n);
-template<typename T>
-void print_device_matrix(T *matrix, int m, int n);
 template<typename T, typename U>
-bool all_close(T *A, U *B, int m, int n);
+bool all_close(T *A, U *B, int total_size);
 
 namespace flash {
 
@@ -449,14 +447,11 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   // num_m_block: seqlen group
   const int m_block = blockIdx.x;
 
-  // NOTE: compute at runtime to reduce thread number
-  // // num_n_block: dim group
-  // const int n_block = blockIdx.y;
-
   // bs * head
-  const int base_offset = blockIdx.y;
+  const int base_id = blockIdx.y;
   // The thread index.
   const int tidx = threadIdx.x;
+  const int bs_head_offset = base_id * params.head_stride;
 
   // TODO: 传入泛型
   // NOTE: 小技巧
@@ -484,22 +479,17 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   // TODO: base offset for MHA
   // NOTE: convert C pointer to Tensor for convenience
   Tensor Q = make_tensor(
-      make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr)),
+      make_gmem_ptr(reinterpret_cast<Element *>(params.q_ptr) + bs_head_offset),
       make_shape(params.seqlen, params.dim),
       make_stride(params.dim, Int<1>{}));
   Tensor K = make_tensor(
-      make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr)),
+      make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr) + bs_head_offset),
       make_shape(params.seqlen, params.dim),
       make_stride(params.dim, Int<1>{}));
   Tensor V = make_tensor(
-      make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr)),
+      make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr) + bs_head_offset),
       make_shape(params.seqlen, params.dim),
       make_stride(params.dim, Int<1>{}));
-  // transpose V for gemm
-  Tensor Vt = make_tensor(
-      make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr)),
-      make_shape(params.dim, params.seqlen),
-      make_stride(Int<1>{}, params.dim));
 
   // 加载Q, K, V分块
   // (kBlockM, kHeadDim, num_tile_n)
@@ -539,9 +529,9 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
 
   // NOTE: 定义smem -> reg拷贝的dst
   // partition_fragment与partition类似, 只是返回的是寄存器表示
-  Tensor tSrQ  = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
-  Tensor tSrK  = thr_mma.partition_fragment_B(sK);                           // (MMA,MMA_N,MMA_K)
-  Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle);                // (MMA, MMA_K,MMA_N)
+  Tensor tSrQ  = thr_mma.partition_fragment_A(sQ); // (MMA,MMA_M,MMA_K)
+  Tensor tSrK  = thr_mma.partition_fragment_B(sK); // (MMA,MMA_N,MMA_K)
+  Tensor tOrVt  = thr_mma.partition_fragment_B(sVtNoSwizzle); // (MMA, MMA_K,MMA_N)
 
   //
   // Copy Atom retiling
@@ -569,19 +559,6 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   // tKgK表示gmem中的K, 用作gmem->smem的src
   // tKsK表示smem中的K, 用作gmem->smem的dst
   // tSsK表示smem中的K, 用作smem->reg的src
-
-
-  // NOTE: make_identity_tensor创建只有形状的tensor用于拷贝
-  // 在copy时用于跳过整块的block
-
-  // // TODO: cQ等用在causal模式, 暂时无用
-  // // Construct identity layout for sQ and sK
-  // Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
-  // Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));    // (BLK_N,BLK_K) -> (blk_n,blk_k)
-
-  // // Repeat the partitioning with identity layouts
-  // Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);       // (ACPY,ACPY_M,ACPY_K) -> (blk_m,blk_k)
-  // Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);   // (BCPY,BCPY_N,BCPY_K) -> (blk_n,blk_k)
 
   // 流水线加载初始Q, K
   // 加载Q到smem
@@ -706,9 +683,9 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   Tensor O = make_tensor(
       // Use ElementAccum(f32) to debug
 #ifdef DEBUG
-      make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.out_ptr)),
+      make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.out_ptr) + bs_head_offset),
 #else
-      make_gmem_ptr(reinterpret_cast<Element *>(params.out_ptr)),
+      make_gmem_ptr(reinterpret_cast<Element *>(params.out_ptr) + bs_head_offset),
 #endif
       make_shape(params.seqlen, params.dim),
       make_stride(params.dim, Int<1>{}));
@@ -731,7 +708,7 @@ __global__ void flash_attention_v2_cutlass_kernel(const Params params) {
   flash::copy(gmem_tiled_copy_O, tOrO, tOgO);
 }
 
-void flash_attention_v2_cuda(FPC *Q, FPC *K, FPC *V, FPC_O *O, int m, int n) {
+void flash_attention_v2_cuda(FPC *Q, FPC *K, FPC *V, FPC_O *O, int bs, int head, int seqlen, int dim) {
   using Kernel_traits = Test_Traits;
   using Element = typename Kernel_traits::Element;
   using SmemLayoutQ = typename Kernel_traits::SmemLayoutQ;
@@ -741,19 +718,12 @@ void flash_attention_v2_cuda(FPC *Q, FPC *K, FPC *V, FPC_O *O, int m, int n) {
   // Q smem size + KV smem size
   constexpr int kSmemSize = Kernel_traits::kSmemSize;
 
-  int bs = 1;
-  int head = 1;
-  int seqlen = m;
-  int dim = n;
   int bs_stride = head * seqlen * dim;
   int head_stride = seqlen * dim;
   int seqlen_stride = dim;
   int dim_stride = 1;
   // int smem_size = kSmemSize;
-  int smem_size = int(sizeof(SharedStorage<Element, SmemLayoutQ, SmemLayoutK, SmemLayoutV>));
-
-  // float softmax_scale = 1.f / sqrtf(static_cast<float>(n));
-  float softmax_scale = 1.f;
+  constexpr size_t smem_size = size_t(sizeof(SharedStorage<Element, SmemLayoutQ, SmemLayoutK, SmemLayoutV>));
 
   Flash_fwd_params params;
   set_params_fprop(params, bs, head, seqlen, dim, bs_stride, head_stride,
@@ -762,26 +732,26 @@ void flash_attention_v2_cuda(FPC *Q, FPC *K, FPC *V, FPC_O *O, int m, int n) {
   const int num_m_block =
       (params.seqlen + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
 
-  assert(params.bs == 1 && params.head == 1 && "bs == head == 1 for testing");
+  auto kernel = &flash_attention_v2_cutlass_kernel<Kernel_traits, IS_CAUSAL, Flash_fwd_params>;
+  // NOTE: smem过大时需要设置
+  if (smem_size >= 48 * 1024) {
+      CUDA_CHECK(cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  }
 
   dim3 grid(num_m_block, params.bs * params.head, 1);
-  // dim3 block(Kernel_traits::kBlockN, 1, 1);
-  // dim3 block(size(Kernel_traits::TiledMma{}));
   dim3 block(size(Kernel_traits::kNThreads));
 
-  flash_attention_v2_cutlass_kernel<Kernel_traits, IS_CAUSAL>
-      <<<grid, block, smem_size>>>(params);
+  kernel<<<grid, block, smem_size>>>(params);
   CUDA_CHECK(cudaGetLastError());
 
   cudaDeviceSynchronize();
 }
 
-void self_attention_cuda(FP *Q, FP *K, FP *V, FP *O, int m, int n, bool is_causal) {
+void self_attention_run(FP *Q, FP *K, FP *V, FP *O, int m, int n, bool is_causal, float sm_scale = 1) {
   int mBlock = 2;
   assert(m % mBlock == 0 && "mBlock should align");
 
-  // float sm_scale = 1.f / sqrtf(static_cast<float>(n));
-  float sm_scale = 1.f;
   FP *sm_o;
   cudaMalloc((void **)&sm_o, sizeof(FP) * m * m);
 
@@ -806,6 +776,12 @@ void self_attention_cuda(FP *Q, FP *K, FP *V, FP *O, int m, int n, bool is_causa
     print("self QK: \n");
     print("%d,%d:\n", TX, TY);
     print_tensor(local_tile(Self, tile, make_coord(TX, TY)));
+    // print("0,1:\n");
+    // print_tensor(local_tile(Self, tile, make_coord(0, 1)));
+    // print("1,0:\n");
+    // print_tensor(local_tile(Self, tile, make_coord(1, 0)));
+    // print("1,1:\n");
+    // print_tensor(local_tile(Self, tile, make_coord(1, 1)));
     free(h_sm_o);
   }
 
@@ -845,6 +821,18 @@ void self_attention_cuda(FP *Q, FP *K, FP *V, FP *O, int m, int n, bool is_causa
   }
 
   cudaFree(sm_o);
+}
+
+void self_attention_cuda(FP *Q, FP *K, FP *V, FP *O, int bs, int head, int seqlen, int dim, bool is_causal, float sm_scale = 1) {
+  int stride = seqlen * dim;
+  int total_size = bs * head * seqlen * dim;
+  for (int i = 0; i < bs * head; i++) {
+    self_attention_run(Q, K, V, O, seqlen, dim, is_causal, sm_scale);
+    Q += stride;
+    K += stride;
+    V += stride;
+    O += stride;
+  }
 }
 
 // naive gemm implement with slice-k
@@ -931,50 +919,28 @@ __global__ void row_softmax(FP *input, FP *output, int n) {
   }
 }
 
-// print matrix
-template <typename T>
-void print_host_matrix(T *matrix, int m, int n) {
-  for (int i = 0; i < m; i++) {
-    for (int j = 0; j < n; j++) {
-      printf("%f, ", matrix[i * n + j]);
-    }
-    printf("\n");
-  }
-}
-
-template <typename T>
-void print_device_matrix(T *dev_ptr, int m, int n) {
-  T *host_ptr = new T[m * n];
-  cudaMemcpy(host_ptr, dev_ptr, sizeof(T) * m * n, cudaMemcpyDeviceToHost);
-
-  for (int i = 0; i < m; i++) {
-    for (int j = 0; j < n; j++) {
-      printf("%.4f ", (float)host_ptr[i * n + j]);
-    }
-    printf("\n");
-  }
-  free(host_ptr);
-}
-
 void test_attention() {
+  int bs = BS;
+  int head = HEAD;
   // seqlen
-  int m = Input_seq;
+  int m = SEQLEN;
   // dim
-  int n = Dim;
+  int n = DIM;
+  int total_size = bs * head * m * n;
 
   // Host pointer
-  FP *h_K = new FP[m * n];
-  FP *h_Q = new FP[m * n];
-  FP *h_V = new FP[m * n];
-  FP *h_O = new FP[m * n];
+  FP *h_K = new FP[total_size];
+  FP *h_Q = new FP[total_size];
+  FP *h_V = new FP[total_size];
+  FP *h_O = new FP[total_size];
 
-  FPC *h_K2 = new FPC[m * n];
-  FPC *h_Q2 = new FPC[m * n];
-  FPC *h_V2 = new FPC[m * n];
-  FPC_O *h_O2 = new FPC_O[m * n];
+  FPC *h_K2 = new FPC[total_size];
+  FPC *h_Q2 = new FPC[total_size];
+  FPC *h_V2 = new FPC[total_size];
+  FPC_O *h_O2 = new FPC_O[total_size];
 
   // 初始化 K, Q, V
-  for (int i = 0; i < m * n; ++i) {
+  for (int i = 0; i < total_size; ++i) {
     h_K[i] = static_cast<FP>(rand()) / RAND_MAX;
     h_Q[i] = static_cast<FP>(rand()) / RAND_MAX;
     h_V[i] = static_cast<FP>(rand()) / RAND_MAX;
@@ -991,37 +957,37 @@ void test_attention() {
   FPC *d_K2, *d_Q2, *d_V2;
   FPC_O *d_O2;
   // Malloc device memory
-  cudaMalloc((void **)&d_K, sizeof(FP) * m * n);
-  cudaMalloc((void **)&d_Q, sizeof(FP) * m * n);
-  cudaMalloc((void **)&d_V, sizeof(FP) * m * n);
-  cudaMalloc((void **)&d_O, sizeof(FP) * m * n);
+  cudaMalloc((void **)&d_K, sizeof(FP) * total_size);
+  cudaMalloc((void **)&d_Q, sizeof(FP) * total_size);
+  cudaMalloc((void **)&d_V, sizeof(FP) * total_size);
+  cudaMalloc((void **)&d_O, sizeof(FP) * total_size);
 
-  cudaMalloc((void **)&d_K2, sizeof(FPC) * m * n);
-  cudaMalloc((void **)&d_Q2, sizeof(FPC) * m * n);
-  cudaMalloc((void **)&d_V2, sizeof(FPC) * m * n);
-  cudaMalloc((void **)&d_O2, sizeof(FPC_O) * m * n);
+  cudaMalloc((void **)&d_K2, sizeof(FPC) * total_size);
+  cudaMalloc((void **)&d_Q2, sizeof(FPC) * total_size);
+  cudaMalloc((void **)&d_V2, sizeof(FPC) * total_size);
+  cudaMalloc((void **)&d_O2, sizeof(FPC_O) * total_size);
 
   // Copy data from host to device
-  cudaMemcpy(d_K, h_K, sizeof(FP) * m * n, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_Q, h_Q, sizeof(FP) * m * n, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_V, h_V, sizeof(FP) * m * n, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_K, h_K, sizeof(FP) * total_size, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_Q, h_Q, sizeof(FP) * total_size, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_V, h_V, sizeof(FP) * total_size, cudaMemcpyHostToDevice);
 
-  cudaMemcpy(d_K2, h_K2, sizeof(FPC) * m * n, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_Q2, h_Q2, sizeof(FPC) * m * n, cudaMemcpyHostToDevice);
-  cudaMemcpy(d_V2, h_V2, sizeof(FPC) * m * n, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_K2, h_K2, sizeof(FPC) * total_size, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_Q2, h_Q2, sizeof(FPC) * total_size, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_V2, h_V2, sizeof(FPC) * total_size, cudaMemcpyHostToDevice);
 
 
   // Run test
   for (int i = 0; i < 1; i++) {
     // Launch kernel
     bool is_causal = IS_CAUSAL;
-    self_attention_cuda(d_Q, d_K, d_V, d_O, m, n, is_causal);
+    self_attention_cuda(d_Q, d_K, d_V, d_O, bs, head, m, n, is_causal, softmax_scale);
 
     CUDA_CHECK(cudaGetLastError());
   }
   cudaDeviceSynchronize();
 
-  int epoch = 1;
+  int epoch = 100;
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
@@ -1029,7 +995,7 @@ void test_attention() {
 
   // test flash attention 2
   for (int i = 0; i < epoch; i++) {
-    flash_attention_v2_cuda(d_Q2, d_K2, d_V2, d_O2, m, n);
+    flash_attention_v2_cuda(d_Q2, d_K2, d_V2, d_O2, bs, head, m, n);
     CUDA_CHECK(cudaGetLastError());
   }
   cudaDeviceSynchronize();
@@ -1043,19 +1009,19 @@ void test_attention() {
   cudaEventDestroy(stop);
 
   // Result back to host
-  cudaMemcpy(h_O, d_O, sizeof(FP) * m * n, cudaMemcpyDeviceToHost);
-  cudaMemcpy(h_O2, d_O2, sizeof(FPC_O) * m * n, cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_O, d_O, sizeof(FP) * total_size, cudaMemcpyDeviceToHost);
+  cudaMemcpy(h_O2, d_O2, sizeof(FPC_O) * total_size, cudaMemcpyDeviceToHost);
 
   cudaDeviceSynchronize();
-
-  assert(all_close(h_O, h_O2, m, n) && "flash attention 1 != flash attention 2");
-
 
   Tensor Cute = make_tensor(h_O2, make_shape(m, n), make_stride(n, 1));
   auto tile = make_tile(8, 8);
   print("cute: \n");
   print_tensor(local_tile(Cute, tile, make_coord(TX, TY)));
   print_tensor(local_tile(Cute, tile, make_coord(TX, TY + 1)));
+
+  assert(all_close(h_O, h_O2, total_size) && "flash attention 1 != flash attention 2");
+
 
 
   cudaFree(d_K);
@@ -1077,8 +1043,8 @@ void test_attention() {
 }
 
 template <typename T, typename U>
-bool all_close(T *A, U *B, int m, int n) {
-  for (int i = 0; i < m * n; i++) {
+bool all_close(T *A, U *B, int total_size) {
+  for (int i = 0; i < total_size; i++) {
     if (fabs(A[i] - B[i]) > 1e-2) {
       printf("A[%d] = %f, B[%d] = %f\n", i, A[i], i, (float)B[i]);
       return false;
@@ -1094,3 +1060,4 @@ int main() {
 
   return 0;
 }
+
