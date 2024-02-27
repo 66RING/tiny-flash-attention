@@ -47,7 +47,7 @@ struct Flash_kernel_traits {
 
 
 // If Share_Q_K_smem is true, that forces Is_Q_in_regs to be true
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, bool Is_Q_in_regs_=false, bool Share_Q_K_smem_=false, typename elem_type=cutlass::half_t,
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::half_t,
          typename Base=Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_, kNWarps_, elem_type> >
 struct Flash_fwd_kernel_traits : public Base {
     using Element = typename Base::Element;
@@ -185,33 +185,5 @@ struct Flash_fwd_kernel_traits : public Base {
 
 
     // TODO: 上面这些都要review
-
-
-    // TODO: standalone test trait
-
-    // TODO:
-    // NOTE: 指定MMA使用的指令
-    // cute抽象底层硬件计算能力成MMA, 一种MMA可以表达一种计算能力, 结合trait可以表达不同硬件的计算能力
-    // using mma_op = SM80_16x8x16_F16F16F16F16_TN;
-    // using mma_op = SM70_8x8x4_F16F16F16F16_TN;
-    // using mma_op = SM80_8x8x4_F64F64F64F64_TN;
-    // using mma_traits = MMA_Traits<mma_op>;
-    // using mma_atom = MMA_Atom<mma_traits>;
-
-    // // TODO: 这里mma atom的make_layout详见本仓库的mma_tile_tex脚本
-    // using MMA = decltype(make_tiled_mma(mma_atom{},
-    //                     make_layout(Shape<_1, _1, _1>{}),   // AtomLayoutMNK
-    //                     make_layout(Shape<_1, _1, _1>{}))); // ValLayoutMNK
-
-
-  // NOTE: 需要特定的MMA布局which is layout A = layout C
-  using mma_op = SM80_16x8x16_F32F16F16F32_TN;
-  using mma_traits = MMA_Traits<mma_op>;
-  using mma_atom = MMA_Atom<mma_traits>;
-
-  using MMA = decltype(make_tiled_mma(
-      mma_atom{}, make_layout(Shape<_1, _1, _1>{}), // AtomLayoutMNK
-      make_layout(Shape<_1, _2, _1>{})));           // ValLayoutMNK
-
 
 };

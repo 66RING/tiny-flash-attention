@@ -9,35 +9,44 @@
 #include "kernel_traits.h"
 #include "utils.h"
 
+#define DEBUG
+
 // data type to test
 using FP = float;
 using FPC = cute::half_t;
 // Out type
+#ifdef DEBUG
+// 精度测试
 using FPC_O = float;
+#else
+using FPC_O = cute::half_t;
+#endif
 // using FPC = double;
 // BLOCK_M(Br, Brow), BLOCK_N(Bc, Bcol) can be determined at compile time
 // just like offical implementation which use a template kernel to do that
 // Block row size
 // TODO: 测试这里多种shape
-const int Bm = 8 * 8;
+const int Bm = 64;
 // Block column size
-const int Bn = 8 * 2;
+const int Bn = 64;
+// TODO: 测试更大规模, 或者warps=2
+
 // seqlen
-// TODO: correctness bug case: bug when seqlen < dim?
-// const int Input_seq = 8 * 4 * 2;
-// const int Dim = 4 * 8 * 4;
-const int Input_seq = 8 * 4 * 4;
+const int Input_seq = 128 * 4;
 // dim
 const int Dim = 4 * 8 * 2;
-// TODO: warp!=1情况有bug
-const int Warps = 1;
+// TODO: causal模式下, warp!=1情况有bug
+// 使用kNThreads
+const int Warps = 4;
+
+const bool IS_CAUSAL = true;
 
 // debug only
-int TX = 0;
+int TX = 3;
 int TY = 0;
 
 // TODO: test trait
-using Test_Traits = Flash_fwd_kernel_traits<Dim, Bm, Bn, Warps, false, false, FPC>;
+using Test_Traits = Flash_fwd_kernel_traits<Dim, Bm, Bn, Warps, FPC>;
 
 
 // Shared Storage with Aligned addresses.
@@ -116,6 +125,7 @@ void set_params_fprop(Flash_fwd_params &params,
 
 __global__ void naive_nrow_gemm(FP *A, FP *B, FP *C, FP a, FP b,
                                 int M, int N, int K, int mBlock);
+__global__ void causal_mask_qk(FP *qk, int m);
 __global__ void row_softmax(FP *input, FP *output, int n);
 __global__ void naive_pv(FP *P, FP *V, FP *O, int M, int N,
                          int mBlock);
@@ -131,7 +141,67 @@ namespace flash {
 
 using namespace cute;
 
-/// TODO: review
+template <int kBlockM, int kBlockN, int kNWarps,typename Engine, typename Layout>
+inline __device__ void mask_within_nblock(Tensor<Engine, Layout> &tensor, const int m_block, const int nbi) {
+    // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
+    static_assert(Layout::rank == 2, "Only support 2D Tensor");
+
+    // NOTE:
+    // 确定一个MMA内的index也是一个难点
+    // (nrow=(2, MMA_M), ncol=(2, MMA_N))形如:
+    //    T1.V0 T1.V1
+    //    T1.V0 T1.V1
+    // 根据mma_tile的示意图来确定col和row值
+
+    // NOTE:
+    // 计算thread的处理范围, mask掉超出范围的部分
+    //
+    // NOTE:
+    // % 32表示32做组, 因为SM80_16x8x16_F32F16F16F32_TN _1_2_1中最大线程数id是32
+    // (lane_id % 4) * 2表示在哪个"颜色"的col(thread)中, *2是为了靠右(即处理的哪个value2)
+    // 因此col_idx_offset表示当前thread所处理的单个Atom中4列的哪列
+
+    // lane_id表示一个MMA tile中的"线程组"
+    const int lane_id = threadIdx.x % 32;
+    const int col_idx_offset = kBlockN * nbi + (lane_id % 4) * 2;
+
+    const int nrow_group = threadIdx.x / 32;
+    const int row_idx_offset = kBlockM * m_block + lane_id / 4 + nrow_group * 16 /* 2*8 */;
+    // (2, nrow), 2*8 for each
+    const int group_stride = kNWarps * 16;
+
+    #pragma unroll
+    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+        // SM80_16x8x16_F32F16F16F32_TN中的一组中, 一行4个线程处理8个value
+        const int col_idx_base = col_idx_offset + nj * 8;
+        #pragma unroll
+        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+            // j用于计算value 1和value 2对应col
+            // col_idx最终表示当前thread所处理的value的列号
+            const int col_idx = col_idx_base + j;
+
+            // mask掉scores中(QK后的结果)超出范围的部分
+            // 列号和行号对比
+
+            // Without the "make_coord" we get wrong results
+            // for nrow(2, MMA_M)
+            #pragma unroll
+            for (int mi = 0; mi < size<0, 0>(tensor); ++mi) {
+
+              #pragma unroll
+              for (int mj = 0; mj < size<0, 1>(tensor); ++mj) {
+                const int row_idx = row_idx_offset + mi * 8 + mj * group_stride;
+                if (col_idx > row_idx) {
+                  tensor(make_coord(mi, mj), make_coord(j, nj)) = -INFINITY;
+                }
+              }
+
+            }
+
+        }
+    }
+}
+
 
 // NOTE: A矩阵已经在寄存器中的gemm封装
 template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
@@ -290,7 +360,18 @@ inline __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor
 }
 
 
+
 // Convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+// TODO: 搞清楚经过convert_layout_acc_rowcol后(nrow=(2, MMA_M), ncol=(2, MMA_N))的数学含义
+// 形象的解释是把
+//    T1.V0
+//    T1.V1
+//    T1.V0
+//    T1.V1
+// 变为
+//    T1.V0 T1.V1
+//    T1.V0 T1.V1
+// 这样符合MMA tile的行列直觉
 template<typename Layout>
 inline __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
     static_assert(decltype(size<0>(acc_layout))::value == 4);
@@ -302,196 +383,66 @@ inline __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
     return make_layout(make_layout(get<1>(get<0>(l)), get<1>(l)), make_layout(get<0>(get<0>(l)), get<2>(l)));
 };
 
-
-template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
-__device__ inline void thread_reduce_(Tensor<Engine0, Layout0> const &tensor, Tensor<Engine1, Layout1> &summary, Operator &op) {
-    static_assert(Layout0::rank == 2, "Only support 2D Tensor");
-    static_assert(Layout1::rank == 1, "Only support 1D Tensor");
-    CUTE_STATIC_ASSERT_V(size<0>(summary) == size<0>(tensor));
-    #pragma unroll
-    for (int mi = 0; mi < size<0>(tensor); mi++) {
-        summary(mi) = zero_init ? tensor(mi, 0) : op(summary(mi), tensor(mi, 0));
-        #pragma unroll
-        for (int ni = 1; ni < size<1>(tensor); ni++) {
-            summary(mi) = op(summary(mi), tensor(mi, ni));
-        }
-    }
-}
-
-template<typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
-__device__ inline void quad_allreduce_(Tensor<Engine0, Layout0> &dst, Tensor<Engine1, Layout1> &src, Operator &op) {
-    CUTE_STATIC_ASSERT_V(size(dst) == size(src));
-    #pragma unroll
-    for (int i = 0; i < size(dst); i++){
-        // NOTE: 4表示4个线程
-        dst(i) = Allreduce<4>::run(src(i), op);
-    }
-}
-
-template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1, typename Operator>
-__device__ inline void reduce_(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &summary, Operator &op) {
-    // NOTE: 遍历tensor每行, 记录到summary中
-    // reduce 当前thread的max
-    thread_reduce_<zero_init>(tensor, summary, op);
-    // NOTE: 二分法对summary[]进行reduce
-    // reduce thread间的max
-    quad_allreduce_(summary, summary, op);
-}
-
-
-template<bool zero_init=true, typename Engine0, typename Layout0, typename Engine1, typename Layout1>
-__device__ inline void reduce_max(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &max){
-    MaxOp<float> max_op;
-    reduce_<zero_init>(tensor, max, max_op);
-}
-
-template<typename Engine0, typename Layout0, typename Engine1, typename Layout1>
-__device__ inline void reduce_sum(Tensor<Engine0, Layout0> const& tensor, Tensor<Engine1, Layout1> &sum){
-    SumOp<float> sum_op;
-    reduce_(tensor, sum, sum_op);
-}
-
-/// TODO: 
-
-template<typename Tensor0, typename Tensor1, typename Tensor2>
-inline __device__ void softmax_rescale_o2(Tensor0 &scores, Tensor1 &scores_max, Tensor1 &scores_sum,
-                                         Tensor2 &acc_o, float softmax_scale_log2) {
-    // NOTE: scores来自acc_s: Q@K.T
-    // acc_s用来暂存QK和softmax的结果[seqlen, seqlen]
-    // acc_o用来存储QK@V的结果[seqlen, dim]
-    // TODO: 为什么这里是输出到acc_o而不是acc_s
-
-    // 记录上一次的max
-    // TODO: 搞清楚max的维度, (MMA_M)??
-    Tensor scores_max_prev = make_fragment_like(scores_max);
-    cute::copy(scores_max, scores_max_prev);
-    // TODO: reduce的实现学习一下
-    // NOTE: 计算新max到scores_max
-    flash::template reduce_max</*zero_init=*/false>(scores, scores_max);
-    // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
-    // TODO: 为什么要reshape acc_o
-    // 因为scores的shape是这样的? 那为什么要reshape scores?
-    Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
-    #pragma unroll
-    for (int mi = 0; mi < size(scores_max); ++mi) {
-        // NOTE: 辅助变量: 当前max
-        float scores_max_cur = scores_max(mi);
-        // NOTE: 计算旧score的rescale值
-        // NOTE: 因为QK(影响max)计算时没有考虑softmax_scale, 所以这里要补上
-        float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
-        // NOTE: rescale旧分母部分
-        scores_sum(mi) *= scores_scale;
-        // NOTE: 旧分子部分rescale
-        // TODO: acc_o_rowcol什么原理?
-        #pragma unroll
-        for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
-    }
-    // NOTE: 计算新分子部分: scores
-    flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
-
-    // NOTE: 累加新分母
-    Tensor scores_sum_cur = make_fragment_like(scores_sum);
-    // NOTE:利用新分子来累加新分母
-    flash::reduce_sum(scores, scores_sum_cur);
-    // NOTE: 新分母累加到旧分母
-    #pragma unroll
-    for (int mi = 0; mi < size(scores_sum); ++mi) { scores_sum(mi) += scores_sum_cur(mi); }
-};
-
-
-/**
-  @params: scores, the result of  QK
-  @params: scores_max, the max of each block of row
-  @params: acc_o, the output
-  @params: softmax_scale_log2, the softmax_scale
- */
-template<typename Tensor0, typename Tensor1, typename Tensor2>
+// TODO: is first优化初次rescale
+template<bool Is_first, typename Tensor0, typename Tensor1, typename Tensor2>
 inline __device__ void softmax_rescale_o(Tensor0 &scores, Tensor1 &scores_max, Tensor1 &scores_sum,
                                          Tensor2 &acc_o, float softmax_scale_log2) {
-  // for each line of QK(scores)
-  // 1. compute new max
-  // 2. rescale old max
-  // 3. sum new denom
-  // 4. rescale old denom
-  // 5. add old denom and new denom
+    // NOTE: scores来自acc_s: Q@K.T
+    // acc_s用来存储QK和softmax的结果[seqlen, seqlen]
+    // acc_o用来存储softmax(QK)结果的分子部分, 用于rescale
+    // 流式计算不断用当前分块计算的结果scors来rescale
 
-  Tensor scores_max_prev = make_fragment_like(scores_max);
-  cute::copy(scores_max, scores_max_prev);
+    if (Is_first) {
+        // NOTE: 优化, 第一次softmax不需要rescale, 只需要记录分子, max, sum
+        reduce_max</*zero_init=*/true>(scores, scores_max);
+        flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
+        reduce_sum(scores, scores_sum);
+    } else {
+        // 记录上一次的max
+        Tensor scores_max_prev = make_fragment_like(scores_max);
+        cute::copy(scores_max, scores_max_prev);
+        // TODO: reduce的实现学习一下
+        // NOTE: 计算新max到scores_max
+        // reduce_max包含步:
+        //  1. 求当前thread内max: 遍历
+        //  2. reduce thread间的max: 使用shift技巧reduce
+        reduce_max</*zero_init=*/false>(scores, scores_max);
+        // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+        // 将acc_o转换成符合2D直觉的(nrow, ncol)的形状
+        Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+        #pragma unroll
+        for (int mi = 0; mi < size(scores_max); ++mi) {
+            // NOTE: 辅助变量: 当前max
+            float scores_max_cur = scores_max(mi);
+            // NOTE: 计算旧score的rescale值
+            // NOTE: 因为QK(影响max)计算时没有考虑softmax_scale, 所以这里要补上
+            float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+            // NOTE: rescale旧分母部分
+            scores_sum(mi) *= scores_scale;
+            // NOTE: 旧分子部分rescale
+            // acc_o_rowcol.shape = (nrow, ncol)
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
+        }
+        // NOTE: 计算新分子部分: 对所有scores进行rescale
+        flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
 
-  // NOTE: 求max
-  // 1. 求当前thread内max
-  for (int j  = 0; j < size<1>(scores); j++) {
-    float local_max = -INFINITY;
-    for (int i = 0; i < size<2>(scores); i++) {
-      for (int k = 0; k < size<0>(scores); k++) {
-        local_max = max(local_max, scores(k, j, i));
-      }
+        // NOTE: 累加新分母
+        Tensor scores_sum_cur = make_fragment_like(scores_sum);
+        // NOTE:利用新分子来累加新分母
+        //  1. 线程内累加: 遍历
+        //  2. 线程间累加: 使用shift技巧reduce
+        reduce_sum(scores, scores_sum_cur);
+        // NOTE: 新分母累加到旧分母
+        #pragma unroll
+        for (int mi = 0; mi < size(scores_sum); ++mi) { scores_sum(mi) += scores_sum_cur(mi); }
     }
-    scores_max(j) = local_max;
-  }
-  // 2. reduce thread间的max
-  MaxOp<float> max_op;
-  quad_allreduce_(scores_max, scores_max, max_op);
-
-  for (int mi = 0; mi < size(scores_max); mi++) {
-    float scores_max_cur = scores_max(mi);
-    // NOTE: 计算旧score的rescale值
-    // NOTE: 因为QK(影响max)计算时没有考虑softmax_scale, 所以这里要补上
-    float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
-
-    // NOTE: rescale旧分母部分
-    scores_sum(mi) *= scores_scale;
-    // NOTE: 旧分子部分rescale
-    assert(size<0>(scores_sum) == size<1>(acc_o) && "sum should have some row with out");
-    #pragma unroll
-    for (int j = 0; j < size<2>(acc_o); j++) {
-      for (int i = 0; i < size<0>(acc_o); i++) {
-        acc_o(i, mi, j) *= scores_scale;
-      }
-    }
-  }
-
-  // TODO:
-  // flash::scale_apply_exp2(scores, scores_max, softmax_scale_log2);
-  // NOTE: rescale所有新分子: QK aka scores
-  // NOTE: 使用exp2f
-  for (int j  = 0; j < size<1>(scores); j++) {
-    for (int i = 0; i < size<2>(scores); i++) {
-      for (int k = 0; k < size<0>(scores); k++) {
-        scores(k, j, i) = exp2f(scores(k, j, i) * softmax_scale_log2 - scores_max(j));
-      }
-    }
-  }
-
-
-  // NOTE:累加新分母
-  // TODO: 对当前写死
-  Tensor scores_sum_cur = make_fragment_like(scores_sum);
-  // 1. 线程内累加新分母
-  for (int j  = 0; j < size<1>(scores); j++) {
-    float local_sum = 0;
-    for (int i = 0; i < size<2>(scores); i++) {
-      for (int k = 0; k < size<0>(scores); k++) {
-        local_sum += scores(k, j, i);
-      }
-    }
-    scores_sum_cur(j) += local_sum;
-  }
-
-  // 2. 线程间累加新分母
-  SumOp<float> sum_op;
-  quad_allreduce_(scores_sum_cur, scores_sum_cur, sum_op);
-
-  // NOTE: 新分母加旧分母
-  for (int i = 0; i < size(scores_sum); i++) {
-      scores_sum(i) += scores_sum_cur(i);
-  }
-}
+};
 
 } // namespace flash
 
-template <typename Kernel_traits, typename Params>
-__global__ void naive_flash_attention_v2_cutlass_kernel(const Params params) {
+template <typename Kernel_traits, bool Is_causal=false, typename Params>
+__global__ void flash_attention_v2_cutlass_kernel(const Params params) {
 
   using namespace cute;
 
@@ -503,7 +454,7 @@ __global__ void naive_flash_attention_v2_cutlass_kernel(const Params params) {
   // const int n_block = blockIdx.y;
 
   // bs * head
-  const int base_offset = blockIdx.z;
+  const int base_offset = blockIdx.y;
   // The thread index.
   const int tidx = threadIdx.x;
 
@@ -520,10 +471,10 @@ __global__ void naive_flash_attention_v2_cutlass_kernel(const Params params) {
   using SmemLayoutVt = typename Kernel_traits::SmemLayoutVtransposed;
   using SmemLayoutVtNoSwizzle = typename Kernel_traits::SmemLayoutVtransposedNoSwizzle;
 
+  constexpr int kNWarps = Kernel_traits::kNWarps;
   constexpr int kBlockM = Kernel_traits::kBlockM;
   constexpr int kBlockN = Kernel_traits::kBlockN;
   constexpr int kHeadDim = Kernel_traits::kHeadDim;
-
 
   // Shared memory.
   extern __shared__ char smem_[];
@@ -646,10 +597,14 @@ __global__ void naive_flash_attention_v2_cutlass_kernel(const Params params) {
   // Q[BLOCK_M, BLOCK_N] @ K[BLOCK_M, BLOCK_N].T = O[BLOCK_M, BLOCK_M]
   //
   // step2:
-  // advance K
+  // advance K, V
+
   // NOTE: K, V分块的数量: 处理的区间
   const int n_block_min = 0;
-  int n_block_max = cute::ceil_div(params.seqlen, kBlockN);
+  // NOTE: 1. mask between N BLOCKs if is causal mode
+  int seqlen_start = m_block * kBlockM;
+  int seqlen_end = (m_block + 1) * kBlockM;
+  int n_block_max = Is_causal ? cute::ceil_div(seqlen_end, kBlockN) : cute::ceil_div(params.seqlen, kBlockN);
 
   // NOTE: 需要记录的max
   Tensor scores_max = make_tensor<ElementAccum>(Shape<Int<2 * size<1>(rAccOut)>>{});
@@ -657,7 +612,6 @@ __global__ void naive_flash_attention_v2_cutlass_kernel(const Params params) {
   Tensor scores_sum = make_fragment_like(scores_max);
 
   clear(rAccOut);
-
 
   for (int nbi = n_block_min; nbi < n_block_max; nbi++) {
     auto rAccScore = partition_fragment_C(tiled_mma, make_shape(Int<kBlockM>{}, Int<kBlockN>{}));
@@ -669,7 +623,7 @@ __global__ void naive_flash_attention_v2_cutlass_kernel(const Params params) {
     flash::cp_async_wait<0>();
     __syncthreads();
 
-    // TODO: gemm的同时异步加载V
+    // gemm的同时异步加载V
     gV = local_tile(V, make_tile(Int<kBlockN>{}, Int<kHeadDim>{}), make_coord(nbi, _));
     tVgV = gmem_thr_copy_QKV.partition_S(gV(_, _, 0));
     // 异步加载V到smem
@@ -683,6 +637,13 @@ __global__ void naive_flash_attention_v2_cutlass_kernel(const Params params) {
         smem_thr_copy_Q, smem_thr_copy_K
     );
 
+    Tensor scores = make_tensor(rAccScore.data(), flash::convert_layout_acc_rowcol(rAccScore.layout()));
+
+    // NOTE: 2. mask within N BLOCKs
+    if (Is_causal ==  true && nbi * kBlockN >= seqlen_start) {
+      flash::mask_within_nblock<kBlockM, kBlockN, kNWarps>(scores, m_block, nbi);
+    }
+
     // NOTE: 等待V加载完成, 为下个K加载准备初始状态
     flash::cp_async_wait<0>();
     __syncthreads();
@@ -695,11 +656,10 @@ __global__ void naive_flash_attention_v2_cutlass_kernel(const Params params) {
       cute::cp_async_fence();
     }
 
-    Tensor scores = make_tensor(rAccScore.data(), flash::convert_layout_acc_rowcol(rAccScore.layout()));
-
     // 计算softmax
     // NOTE: rAccOut记录softmax后所有的分子
-    flash::softmax_rescale_o2(scores, scores_max, scores_sum, rAccOut, params.softmax_scale);
+    nbi == 0 ? flash::softmax_rescale_o</*Is_first=*/true>(scores, scores_max, scores_sum, rAccOut, params.softmax_scale) :
+      flash::softmax_rescale_o</*Is_first=*/false>(scores, scores_max, scores_sum, rAccOut, params.softmax_scale);
 
     // 实际执行QK @ V
     // (score AKA rAccScore): QK[M, N] @ V[N, dim]
@@ -713,15 +673,20 @@ __global__ void naive_flash_attention_v2_cutlass_kernel(const Params params) {
   }
 
   // NOTE: 最后统一除上分母部分
-  for (int j  = 0; j < size<1>(rAccOut); j++) {
-    float inv_sum = 1.f / scores_sum(j);
-    for (int i = 0; i < size<2>(rAccOut); i++) {
-      for (int k = 0; k < size<0>(rAccOut); k++) {
-        rAccOut(k, j, i) *= inv_sum;
-      }
+  // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+  Tensor acc_o_rowcol = make_tensor(rAccOut.data(), flash::convert_layout_acc_rowcol(rAccOut.layout()));
+  // for row
+  #pragma unroll
+  for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
+    float sum = scores_sum(mi);
+    float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
+    float scale = inv_sum;
+    // for col
+    #pragma unroll
+    for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { 
+      acc_o_rowcol(mi, ni) *= scale; 
     }
   }
-
 
   // Convert acc_o from fp32 to fp16/bf16
   Tensor rO = flash::convert_type_f32_to_f16(rAccOut);
@@ -739,7 +704,12 @@ __global__ void naive_flash_attention_v2_cutlass_kernel(const Params params) {
   cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
 
   Tensor O = make_tensor(
+      // Use ElementAccum(f32) to debug
+#ifdef DEBUG
       make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.out_ptr)),
+#else
+      make_gmem_ptr(reinterpret_cast<Element *>(params.out_ptr)),
+#endif
       make_shape(params.seqlen, params.dim),
       make_stride(params.dim, Int<1>{}));
   Tensor gO = local_tile(O, make_tile(Int<kBlockM>{}, Int<kHeadDim>{}), make_coord(m_block, _));
@@ -760,9 +730,6 @@ __global__ void naive_flash_attention_v2_cutlass_kernel(const Params params) {
 
   flash::copy(gmem_tiled_copy_O, tOrO, tOgO);
 }
-
-template <typename Kernel_traits, typename Params>
-__global__ void flash_attention_v2_cutlass_kernel(const Params &params) {}
 
 void flash_attention_v2_cuda(FPC *Q, FPC *K, FPC *V, FPC_O *O, int m, int n) {
   using Kernel_traits = Test_Traits;
@@ -785,7 +752,6 @@ void flash_attention_v2_cuda(FPC *Q, FPC *K, FPC *V, FPC_O *O, int m, int n) {
   // int smem_size = kSmemSize;
   int smem_size = int(sizeof(SharedStorage<Element, SmemLayoutQ, SmemLayoutK, SmemLayoutV>));
 
-
   // float softmax_scale = 1.f / sqrtf(static_cast<float>(n));
   float softmax_scale = 1.f;
 
@@ -793,37 +759,27 @@ void flash_attention_v2_cuda(FPC *Q, FPC *K, FPC *V, FPC_O *O, int m, int n) {
   set_params_fprop(params, bs, head, seqlen, dim, bs_stride, head_stride,
                    seqlen_stride, dim_stride, Q, K, V, O, softmax_scale);
 
-  // const int num_m_block =
-  //     (params.seqlen + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
-  // assert(params.bs == 1 && params.head == 1 && "bs == head == 1 for testing");
-  // dim3 grid(num_m_block, params.bs, params.head);
-  // dim3 block(Kernel_traits::kBlockN, 1, 1);
-
   const int num_m_block =
       (params.seqlen + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
-  // TODO: dim维度分块数量
-  const int num_n_block =
-      (params.dim + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
 
   assert(params.bs == 1 && params.head == 1 && "bs == head == 1 for testing");
 
-  dim3 grid(num_m_block, 1, params.bs * params.head);
+  dim3 grid(num_m_block, params.bs * params.head, 1);
   // dim3 block(Kernel_traits::kBlockN, 1, 1);
-  dim3 block(size(Kernel_traits::MMA{}));
+  // dim3 block(size(Kernel_traits::TiledMma{}));
+  dim3 block(size(Kernel_traits::kNThreads));
 
-  // TODO: smem_size
-  naive_flash_attention_v2_cutlass_kernel<Kernel_traits>
+  flash_attention_v2_cutlass_kernel<Kernel_traits, IS_CAUSAL>
       <<<grid, block, smem_size>>>(params);
   CUDA_CHECK(cudaGetLastError());
 
   cudaDeviceSynchronize();
 }
 
-void self_attention_cuda(FP *Q, FP *K, FP *V, FP *O, int m, int n) {
+void self_attention_cuda(FP *Q, FP *K, FP *V, FP *O, int m, int n, bool is_causal) {
   int mBlock = 2;
   assert(m % mBlock == 0 && "mBlock should align");
 
-  // TODO: test
   // float sm_scale = 1.f / sqrtf(static_cast<float>(n));
   float sm_scale = 1.f;
   FP *sm_o;
@@ -832,10 +788,14 @@ void self_attention_cuda(FP *Q, FP *K, FP *V, FP *O, int m, int n) {
   dim3 qk_block(m / mBlock, 1, 1);
   naive_nrow_gemm<<<1, qk_block>>>(Q, K, sm_o, sm_scale, 0, m, m, n, mBlock);
   cudaDeviceSynchronize();
-  DEBUG_BLOCK(CUDA_CHECK(cudaGetLastError()); 
-      printf("== naive QK ==\n");
-      print_device_matrix(sm_o, m, m);
-      );
+
+  // causal mask
+  if (is_causal == true) {
+    // QK[M, M]
+    dim3 grid(m / mBlock, 1, 1);
+    dim3 block(mBlock, 1, 1);
+    causal_mask_qk<<<grid, block>>>(sm_o, m);
+  }
 
   {
     // TODO: test QK only
@@ -843,12 +803,9 @@ void self_attention_cuda(FP *Q, FP *K, FP *V, FP *O, int m, int n) {
     cudaMemcpy(h_sm_o, sm_o, sizeof(FP) * m * m, cudaMemcpyDeviceToHost);
     Tensor Self = make_tensor(h_sm_o, make_shape(m, m), make_stride(m, 1));
     auto tile = make_tile(8, 8);
-    auto coor = make_coord(TX, TY);
-    Tensor tSelf = local_tile(Self, tile, coor);
     print("self QK: \n");
-    print_tensor(local_tile(Self, tile, make_coord(0, 0)));
-    print("x,1:\n");
-    print_tensor(local_tile(Self, tile, make_coord(0, 1)));
+    print("%d,%d:\n", TX, TY);
+    print_tensor(local_tile(Self, tile, make_coord(TX, TY)));
     free(h_sm_o);
   }
 
@@ -856,9 +813,6 @@ void self_attention_cuda(FP *Q, FP *K, FP *V, FP *O, int m, int n) {
   dim3 sm_block(m, 1, 1);
   row_softmax<<<1, sm_block>>>(sm_o, sm_o, m);
   cudaDeviceSynchronize();
-  DEBUG_BLOCK(CUDA_CHECK(cudaGetLastError());
-              printf("== naive softmax(QK) ==\n");
-              print_device_matrix(sm_o, m, m););
   {
     // TODO: test QK only
     FP *h_sm_o = new FP[m * m];
@@ -876,9 +830,6 @@ void self_attention_cuda(FP *Q, FP *K, FP *V, FP *O, int m, int n) {
   dim3 qkv_block(m / mBlock, 1, 1);
   naive_pv<<<1, qkv_block>>>(sm_o, V, O, m, n, mBlock);
   cudaDeviceSynchronize();
-  DEBUG_BLOCK(CUDA_CHECK(cudaGetLastError());
-              printf("== naive softmax(QK)V ==\n");
-              print_device_matrix(O, m, n););
 
   {
     FP *h_sm_o = new FP[m * n];
@@ -887,9 +838,9 @@ void self_attention_cuda(FP *Q, FP *K, FP *V, FP *O, int m, int n) {
     auto tile = make_tile(8, 8);
     auto coor = make_coord(TX, TY);
     print("self O: \n");
-    print_tensor(local_tile(Self, tile, make_coord(0, 0)));
+    print_tensor(local_tile(Self, tile, make_coord(TX, TY)));
     print("x,1:\n");
-    print_tensor(local_tile(Self, tile, make_coord(0, 1)));
+    print_tensor(local_tile(Self, tile, make_coord(TX, TY+1)));
     free(h_sm_o);
   }
 
@@ -918,6 +869,16 @@ __global__ void naive_nrow_gemm(FP *A, FP *B, FP *C, FP a, FP b,
       // C = aA@B + bC
       C[i * N + j] = a * sum + b * C[i * N + j];
     }
+  }
+}
+
+__global__ void causal_mask_qk(FP *qk, int m) {
+  // each thread process a row
+  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+  int row = idx;
+  for (int j = row + 1; j < m; j++) {
+    qk[row * m + j] = -INFINITY;
   }
 }
 
@@ -1014,12 +975,12 @@ void test_attention() {
 
   // 初始化 K, Q, V
   for (int i = 0; i < m * n; ++i) {
-    // h_K[i] = static_cast<FP>(rand()) / RAND_MAX;
-    // h_Q[i] = static_cast<FP>(rand()) / RAND_MAX;
-    // h_V[i] = static_cast<FP>(rand()) / RAND_MAX;
-    h_K[i] = static_cast<FP>(0.0001f * i);
-    h_Q[i] = static_cast<FP>(0.0001f * i);
-    h_V[i] = static_cast<FP>(0.0001f * i);
+    h_K[i] = static_cast<FP>(rand()) / RAND_MAX;
+    h_Q[i] = static_cast<FP>(rand()) / RAND_MAX;
+    h_V[i] = static_cast<FP>(rand()) / RAND_MAX;
+    // h_K[i] = static_cast<FP>(0.0001f * i);
+    // h_Q[i] = static_cast<FP>(0.0001f * i);
+    // h_V[i] = static_cast<FP>(0.0001f * i);
 
     h_Q2[i] = FPC(h_Q[i]);
     h_K2[i] = FPC(h_K[i]);
@@ -1049,21 +1010,25 @@ void test_attention() {
   cudaMemcpy(d_Q2, h_Q2, sizeof(FPC) * m * n, cudaMemcpyHostToDevice);
   cudaMemcpy(d_V2, h_V2, sizeof(FPC) * m * n, cudaMemcpyHostToDevice);
 
+
+  // Run test
+  for (int i = 0; i < 1; i++) {
+    // Launch kernel
+    bool is_causal = IS_CAUSAL;
+    self_attention_cuda(d_Q, d_K, d_V, d_O, m, n, is_causal);
+
+    CUDA_CHECK(cudaGetLastError());
+  }
+  cudaDeviceSynchronize();
+
+  int epoch = 1;
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
   cudaEventRecord(start, 0);
 
-  // Run test
-  for (int i = 0; i < 1; i++) {
-    // Launch kernel
-    self_attention_cuda(d_Q, d_K, d_V, d_O, m, n);
-
-    CUDA_CHECK(cudaGetLastError());
-  }
-
   // test flash attention 2
-  for (int i = 0; i < 1; i++) {
+  for (int i = 0; i < epoch; i++) {
     flash_attention_v2_cuda(d_Q2, d_K2, d_V2, d_O2, m, n);
     CUDA_CHECK(cudaGetLastError());
   }
@@ -1083,20 +1048,14 @@ void test_attention() {
 
   cudaDeviceSynchronize();
 
-  // assert(all_close(h_O, h_O2, m, n) && "flash attention 1 != flash attention
-  // 2");
+  assert(all_close(h_O, h_O2, m, n) && "flash attention 1 != flash attention 2");
 
 
   Tensor Cute = make_tensor(h_O2, make_shape(m, n), make_stride(n, 1));
   auto tile = make_tile(8, 8);
-  auto coor = make_coord(TX, TY);
-  Tensor tCute = local_tile(Cute, tile, coor);
   print("cute: \n");
-  print_tensor(local_tile(Cute, tile, make_coord(0, 0)));
-  print_tensor(local_tile(Cute, tile, make_coord(0, 1)));
-  // print_tensor(local_tile(Cute, tile, make_coord(0, 2)));
-  // print_tensor(local_tile(Cute, tile, make_coord(0, 3)));
-  // print_tensor(Cute);
+  print_tensor(local_tile(Cute, tile, make_coord(TX, TY)));
+  print_tensor(local_tile(Cute, tile, make_coord(TX, TY + 1)));
 
 
   cudaFree(d_K);
@@ -1120,8 +1079,8 @@ void test_attention() {
 template <typename T, typename U>
 bool all_close(T *A, U *B, int m, int n) {
   for (int i = 0; i < m * n; i++) {
-    if (fabs(A[i] - B[i]) > 1e-5) {
-      printf("A[%d] = %f, B[%d] = %f\n", i, A[i], i, B[i]);
+    if (fabs(A[i] - B[i]) > 1e-2) {
+      printf("A[%d] = %f, B[%d] = %f\n", i, A[i], i, (float)B[i]);
       return false;
     }
   }

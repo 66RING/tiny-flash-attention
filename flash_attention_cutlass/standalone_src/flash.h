@@ -27,6 +27,8 @@ struct Qkv_params {
     // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
     // different from nheads (query).
     int h_h_k_ratio; // precompute h / h_k,
+
+    bool is_bf16 = false;
 };
 
 
@@ -43,5 +45,7 @@ struct Flash_fwd_params : public Qkv_params {
 
   float softmax_scale;
   void *__restrict__ out_ptr;
+
+  bool is_causal;
 };
 
