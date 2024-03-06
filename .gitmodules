@@ -1,0 +1,4 @@
+[submodule "flash_attention_cutlass/deps/cutlass"]
+	path = flash_attention_cutlass/deps/cutlass
+	url = https://github.com/NVIDIA/cutlass
+	branch = main

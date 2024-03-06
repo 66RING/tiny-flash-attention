@@ -1,2 +1,4 @@
 build/
 .cache/
+dist/
+tiny_attention_cutlass.egg-info/
