@@ -10,7 +10,7 @@ from torch.utils.cpp_extension import (
 )
 
 # package name managed by pip, which can be remove by `pip uninstall tiny_pkg`
-PACKAGE_NAME = "tiny_flash_attn"
+PACKAGE_NAME = "tiny_attention_cuda"
 
 ext_modules = []
 generator_flag = []
@@ -42,11 +42,11 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 ext_modules.append(
     CUDAExtension(
         # package name for import
-        name="tiny_flash_attn_2",
+        name="attention_cuda",
         sources=[
-            "csrc/flash_attn.cu",
-            "csrc/flash_attn_hdim64_fp32.cu",
-            "csrc/flash_api.cpp",
+            "csrc/attention_api.cpp",
+            "csrc/flash_attention.cu",
+            "csrc/self_attention.cu",
         ],
         extra_compile_args={
             # add c compile flags
@@ -55,11 +55,12 @@ ext_modules.append(
             "nvcc": [
                     "-O3",
                     "-std=c++17",
+                    # TODO: half支持是因为这个?
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "--use_fast_math",
+                    "-lineinfo",
                     # "--ptxas-options=-v",
                     # "--ptxas-options=-O2",
-                    # "-lineinfo",
                 ]
                 + generator_flag
                 + cc_flag,
@@ -83,10 +84,9 @@ setup(
             "dist",
             "docs",
             "benchmarks",
-            "flash_attn.egg-info",
         )
     ),
-    description="Tiny cuda and c api binding for pytorch.",
+    description="Attention mechanism implement by CUDA",
     ext_modules=ext_modules,
     cmdclass={ "build_ext": BuildExtension},
     python_requires=">=3.7",
@@ -97,6 +97,7 @@ setup(
         "ninja",
     ],
 )
+
 
 
 
