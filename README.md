@@ -15,5 +15,10 @@ A tiny [flash attention](https://github.com/Dao-AILab/flash-attention) implement
     * [x] [cutlass cuda code](./flash_attention_cutlass/csrc/flash_attention.cu)
 - [rust version]
 
+## cutlass cute flash attention in action
+
+- [en tutorial](./cutlass_cute_tutorial_en.md)
+- [zh tutorial](./cutlass_cute_tutorial_zh.md)
+
 
 
