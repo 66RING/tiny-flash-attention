@@ -72,7 +72,9 @@ struct Flash_fwd_kernel_traits : public Base {
     using TiledMma = TiledMMA<
         typename Base::MMA_Atom_Arch,
         Layout<Shape<Int<kNWarps>,_1,_1>>,  // 4x1x1 or 8x1x1 thread group
+        // NOTE: cutlass v3.3
         // typename Base::ValLayoutMNK>; // 1x2x1 or 1x2x2 value group for 16x16x16 MMA and LDSM
+        // cutlass v3.4
         Tile<Int<16 * kNWarps>, _16, _16>>;
 
     using SmemLayoutAtomQ = decltype(
@@ -181,7 +183,4 @@ struct Flash_fwd_kernel_traits : public Base {
                         GmemLayoutAtomRotcossin{},
                         Layout<Shape < _1, _8>>{}));  // Val layout, 8 vals per load
 
-
-
-    // TODO: 上面这些都要review
 };

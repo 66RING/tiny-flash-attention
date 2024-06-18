@@ -17,6 +17,8 @@ A tiny [flash attention](https://github.com/Dao-AILab/flash-attention) implement
 
 ## cutlass cute flash attention in action
 
+my env: cutlass v3.4, torch 1.14, cuda 12.4
+
 - [en tutorial](./cutlass_cute_tutorial_en.md)
 - [zh tutorial](./cutlass_cute_tutorial_zh.md)
 

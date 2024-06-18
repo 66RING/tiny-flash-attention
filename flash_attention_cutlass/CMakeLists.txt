@@ -6,10 +6,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 
-
 find_package(CUDAToolkit REQUIRED)
 include_directories(
-    "third-party/cutlass/include"
+    "deps/cutlass/include"
     "include"
 )
 
