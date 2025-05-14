@@ -45,7 +45,7 @@ torch::Tensor self_attention_cuda(torch::Tensor q, torch::Tensor k, torch::Tenso
   // NOTE: AT_DISPATCH_FLOATING_TYPES_AND_HALF(TYPE, NAME, ...)
   // We need a way of determining at runtime what type a tensor is and then
   // selectively call functions with the corresponding correct type signature.
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.type(), "QK", ([&] {
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(), "QK", ([&] {
                                naive_nrow_gemm<scalar_t><<<1, qk_block>>>(
                                    q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(),
                                    qk.data_ptr<scalar_t>(), sm_scale, 0.f, m, m, n, mBlock);
@@ -58,7 +58,7 @@ torch::Tensor self_attention_cuda(torch::Tensor q, torch::Tensor k, torch::Tenso
   // QK[M, M]
   // TODO: too much thread may cause CUDA crash.
   dim3 sm_block(m, 1, 1);
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(qk.type(), "softmax(QK)", ([&] {
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(qk.scalar_type(), "softmax(QK)", ([&] {
                               row_softmax<scalar_t><<<1, sm_block>>>(
                                   qk.data_ptr<scalar_t>(), qk.data_ptr<scalar_t>(), m);
                              }));
@@ -68,7 +68,7 @@ torch::Tensor self_attention_cuda(torch::Tensor q, torch::Tensor k, torch::Tenso
 
   // QK[M, M] @ V[M, N]
   dim3 qkv_block(m / mBlock, 1, 1);
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(out.type(), "softmax(QK)V", ([&] {
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(out.scalar_type(), "softmax(QK)V", ([&] {
                               naive_pv<scalar_t><<<1, qkv_block>>>(
                                   qk.data_ptr<scalar_t>(), v.data_ptr<scalar_t>(),
                                   out.data_ptr<scalar_t>(), m, n, mBlock);
