@@ -355,7 +355,7 @@ torch::Tensor flash_attention_v1_cuda(torch::Tensor q, torch::Tensor k,
   // We need a way of determining at runtime what type a tensor is and then
   // selectively call functions with the corresponding correct type signature.
   AT_DISPATCH_FLOATING_TYPES_AND_HALF(
-      q.type(), "flash_attn_v1", ([&] {
+      q.scalar_type(), "flash_attn_v1", ([&] {
         FWD_HEADDIM_SWITCH(dim, [&]{
             flash_attention_v1_kernel<scalar_t, Bc, Br, kHeadDim>
                 <<<grid, block>>>(q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(),
@@ -408,7 +408,7 @@ torch::Tensor flash_attention_v2_cuda(torch::Tensor q, torch::Tensor k,
   // NOTE: AT_DISPATCH_FLOATING_TYPES_AND_HALF(TYPE, NAME, ...)
   // We need a way of determining at runtime what type a tensor is and then
   // selectively call functions with the corresponding correct type signature.
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.type(), "flash_attn_v2", ([&] {
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(q.scalar_type(), "flash_attn_v2", ([&] {
     FWD_HEADDIM_SWITCH(dim, [&]{
       flash_attention_v2_kernel<scalar_t, Bc, Br, kHeadDim><<<grid, block>>>(
           q.data_ptr<scalar_t>(), k.data_ptr<scalar_t>(),
