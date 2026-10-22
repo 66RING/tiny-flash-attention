@@ -199,6 +199,6 @@ def flash_attn(q, k, v, device='cpu', BLOCK_M=4):
     '''
     Memory effective flash attention implement
     '''
-    flash_attn_v2_multihead(q, k, v, device, BLOCK_M=BLOCK_M)
+    return flash_attn_v2_multihead(q, k, v, device, BLOCK_M=BLOCK_M)
 
 
